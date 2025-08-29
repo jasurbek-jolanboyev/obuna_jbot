@@ -1,0 +1,900 @@
+# bot_inline_fixed.py
+import asyncio
+import sqlite3
+from datetime import datetime
+import random
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram import BaseMiddleware
+from instagrapi import Client
+from cryptography.fernet import Fernet
+import os
+import sys
+
+# -----------------------
+# CONFIG - o'zgartiring
+# -----------------------
+TELEGRAM_TOKEN = '8236696657:AAEAAMIz2peAuLvXzgMvzcJT2GEt1SRyDOA'  # <-- bot token
+ADMIN_USERNAME = 'serinaqu'
+INSTAGRAM_USERNAME = ''  # agar ishlatilsa to'ldiring
+INSTAGRAM_PASSWORD = ''  # agar ishlatilsa to'ldiring
+PROXY = {'proxy': {'https': 'http://proxy_user:proxy_pass@proxy_host:proxy_port'}}  # kerak bo'lsa
+ENCRYPTION_KEY_FILE = 'encryption_key.key'
+DB_FILE = 'users.db'
+
+# -----------------------
+# Logging
+# -----------------------
+logging.basicConfig(
+    filename='bot.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+def log_action(action, user_id):
+    logging.info(f"{action} by user {user_id} at {datetime.now()}")
+
+# -----------------------
+# Encryption key
+# -----------------------
+def generate_encryption_key():
+    try:
+        if not os.path.exists(ENCRYPTION_KEY_FILE):
+            key = Fernet.generate_key()
+            with open(ENCRYPTION_KEY_FILE, 'wb') as f:
+                f.write(key)
+            logging.info("Yangi shifrlash kaliti yaratildi")
+        with open(ENCRYPTION_KEY_FILE, 'rb') as f:
+            return f.read()
+    except Exception as e:
+        logging.error(f"Shifrlash kaliti yaratish xatosi: {str(e)}")
+        print(f"Xato: Shifrlash kaliti yaratilmadi: {str(e)}")
+        return None
+
+ENCRYPTION_KEY = generate_encryption_key()
+if ENCRYPTION_KEY is None:
+    print("Kritik xato: Shifrlash kaliti yaratilmadi. Bot ishlamaydi.")
+    sys.exit(1)
+cipher = Fernet(ENCRYPTION_KEY)
+
+# -----------------------
+# Database helpers
+# -----------------------
+def init_db():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS users
+                     (user_id INTEGER PRIMARY KEY, username TEXT, phone TEXT, join_date TEXT, 
+                      country TEXT, language TEXT, activity_level INTEGER, referrals INTEGER, 
+                      balance INTEGER DEFAULT 0, referrer_id INTEGER)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS mandatory_channels
+                     (channel TEXT PRIMARY KEY)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS reklama_groups
+                     (group_id TEXT PRIMARY KEY)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS user_ads
+                     (ad_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, ad_text TEXT, 
+                      status TEXT DEFAULT 'pending', created_at TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS payments
+                     (payment_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, 
+                      method TEXT, status TEXT DEFAULT 'pending', created_at TEXT)''')
+        conn.commit()
+        conn.close()
+        logging.info("Ma'lumotlar bazasi muvaffaqiyatli ishga tushirildi")
+    except Exception as e:
+        logging.error(f"Ma'lumotlar bazasi xatosi: {str(e)}")
+        print(f"Xato: Ma'lumotlar bazasi ishga tushmadi: {str(e)}")
+
+def encrypt_data(data):
+    try:
+        if data is None:
+            return None
+        return cipher.encrypt(str(data).encode()).decode()
+    except Exception as e:
+        logging.error(f"Shifrlash xatosi: {str(e)}")
+        return None
+
+def decrypt_data(data):
+    try:
+        if data is None:
+            return None
+        return cipher.decrypt(data.encode()).decode()
+    except Exception as e:
+        logging.error(f"Deshifrlash xatosi: {str(e)}")
+        return None
+
+def add_user(user_id, username, phone=None, country="UZ", language="uz", activity_level=1, referrer_id=None):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        phone_encrypted = encrypt_data(phone) if phone else None
+        username_encrypted = encrypt_data(username) if username else None
+        c.execute("""INSERT OR IGNORE INTO users
+                     (user_id, username, phone, join_date, country, language, activity_level, referrals, balance, referrer_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (user_id, username_encrypted, phone_encrypted, datetime.now(), country, language, activity_level, 0, 0, referrer_id))
+        conn.commit()
+        conn.close()
+        logging.info(f"Foydalanuvchi {user_id} qo'shildi")
+    except Exception as e:
+        logging.error(f"Foydalanuvchi qo'shish xatosi: {str(e)}")
+
+def get_stats():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) as total, SUM(CASE WHEN activity_level > 0 THEN 1 ELSE 0 END) as active FROM users")
+        result = c.fetchone()
+        c.execute("SELECT join_date FROM users ORDER BY join_date")
+        dates = [row[0].split()[0] for row in c.fetchall()]
+        growth = {}
+        for date in dates:
+            growth[date] = growth.get(date, 0) + 1
+        conn.close()
+        total = result[0] if result else 0
+        active = result[1] if result and result[1] else total
+        return {"total_users": total, "active_users": active, "growth": growth}
+    except Exception as e:
+        logging.error(f"Statistika olish xatosi: {str(e)}")
+        return {"total_users": 0, "active_users": 0, "growth": {}}
+
+def filter_users(country=None, language=None, activity_level=None):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        query = "SELECT * FROM users WHERE 1=1"
+        params = []
+        if country:
+            query += " AND country = ?"
+            params.append(country)
+        if language:
+            query += " AND language = ?"
+            params.append(language)
+        if activity_level is not None:
+            query += " AND activity_level = ?"
+            params.append(activity_level)
+        c.execute(query, params)
+        users = c.fetchall()
+        decrypted_users = []
+        for user in users:
+            decrypted_user = list(user)
+            decrypted_user[1] = decrypt_data(user[1]) if user[1] else None
+            decrypted_user[2] = decrypt_data(user[2]) if user[2] else None
+            decrypted_users.append(decrypted_user)
+        conn.close()
+        return decrypted_users
+    except Exception as e:
+        logging.error(f"Foydalanuvchilarni filter qilish xatosi: {str(e)}")
+        return []
+
+# -----------------------
+# Small utilities (captcha/referral/insta)
+# -----------------------
+async def verify_user(user_id):
+    try:
+        num1, num2 = random.randint(1, 10), random.randint(1, 10)
+        correct_answer = num1 + num2
+        return {"question": f"{num1} + {num2} = ?", "answer": correct_answer}
+    except Exception as e:
+        logging.error(f"CAPTCHA yaratish xatosi: {str(e)}")
+        return {"question": "Xato yuz berdi", "answer": 0}
+
+async def generate_referral_link(user_id):
+    try:
+        me = await bot.get_me()
+        return f"https://t.me/{me.username}?start={user_id}"
+    except Exception as e:
+        logging.error(f"Referral havola yaratish xatosi: {str(e)}")
+        return "Havola yaratishda xato"
+
+async def process_referral(referred_user_id, referrer_id):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("UPDATE users SET referrals = referrals + 1, balance = balance + 5 WHERE user_id = ?", (referrer_id,))
+        c.execute("SELECT referrer_id FROM users WHERE user_id = ?", (referrer_id,))
+        second_level = c.fetchone()
+        if second_level and second_level[0]:
+            c.execute("UPDATE users SET balance = balance + 2 WHERE user_id = ?", (second_level[0],))
+        conn.commit()
+        conn.close()
+        log_action(f"Referral processed for {referrer_id}", referred_user_id)
+    except Exception as e:
+        logging.error(f"Referral qayta ishlash xatosi: {str(e)}")
+
+async def add_instagram_follower(username, password, target_account):
+    if not username or not password:
+        return {"status": "error", "message": "Instagram login ma'lumotlari kiritilmagan"}
+    try:
+        cl = Client(**PROXY)
+        cl.login(username, password)
+        user_id = cl.user_id_from_username(target_account)
+        cl.user_follow(user_id)
+        return {"status": "success"}
+    except Exception as e:
+        logging.error(f"Instagram obuna xatosi: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+# -----------------------
+# Payments & ads & channels
+# -----------------------
+async def process_payment(user_id, amount, method):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT INTO payments (user_id, amount, method, status, created_at) VALUES (?, ?, ?, ?, ?)",
+                  (user_id, amount, method, 'pending', datetime.now()))
+        conn.commit()
+        conn.close()
+        return {"status": "pending", "message": f"{method} orqali {amount} so'm to'lov so'raldi. Admin tasdiqlashini kuting."}
+    except Exception as e:
+        logging.error(f"To'lov qayta ishlash xatosi: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+def add_balance(user_id, amount):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+        conn.commit()
+        conn.close()
+        logging.info(f"Balans qo'shildi: {user_id} ga {amount} birlik")
+    except Exception as e:
+        logging.error(f"Balans qo'shish xatosi: {str(e)}")
+
+def get_balance(user_id):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        result = c.fetchone()
+        conn.close()
+        return result[0] if result else 0
+    except Exception as e:
+        logging.error(f"Balans olish xatosi: {str(e)}")
+        return 0
+
+async def post_ad(ad_text, group, bot, user_id):
+    try:
+        await bot.send_message(chat_id=group, text=ad_text)
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT INTO user_ads (user_id, ad_text, status, created_at) VALUES (?, ?, ?, ?)",
+                  (user_id, ad_text, 'posted', datetime.now()))
+        conn.commit()
+        conn.close()
+        logging.info(f"Reklama joylandi: {user_id} tomonidan")
+        return True
+    except Exception as e:
+        logging.error(f"Reklama joylash xatosi: {str(e)}")
+        return False
+
+def get_mandatory_channels():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT channel FROM mandatory_channels")
+        channels = [row[0] for row in c.fetchall()]
+        conn.close()
+        return channels
+    except Exception as e:
+        logging.error(f"Majburiy kanallar olish xatosi: {str(e)}")
+        return []
+
+def add_mandatory_channel(channel):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO mandatory_channels (channel) VALUES (?)", (channel,))
+        conn.commit()
+        conn.close()
+        logging.info(f"Majburiy kanal qo'shildi: {channel}")
+    except Exception as e:
+        logging.error(f"Kanal qo'shish xatosi: {str(e)}")
+
+def remove_mandatory_channel(channel):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM mandatory_channels WHERE channel = ?", (channel,))
+        conn.commit()
+        conn.close()
+        logging.info(f"Majburiy kanal o'chirildi: {channel}")
+    except Exception as e:
+        logging.error(f"Kanal o'chirish xatosi: {str(e)}")
+
+def get_reklama_groups():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT group_id FROM reklama_groups")
+        groups = [row[0] for row in c.fetchall()]
+        conn.close()
+        return groups
+    except Exception as e:
+        logging.error(f"Reklama guruhlari olish xatosi: {str(e)}")
+        return []
+
+def add_reklama_group(group):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO reklama_groups (group_id) VALUES (?)", (group,))
+        conn.commit()
+        conn.close()
+        logging.info(f"Reklama guruhi qo'shildi: {group}")
+    except Exception as e:
+        logging.error(f"Guruh qo'shish xatosi: {str(e)}")
+
+def remove_reklama_group(group):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM reklama_groups WHERE group_id = ?", (group,))
+        conn.commit()
+        conn.close()
+        logging.info(f"Reklama guruhi o'chirildi: {group}")
+    except Exception as e:
+        logging.error(f"Guruh o'chirish xatosi: {str(e)}")
+
+def get_user_ads():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT * FROM user_ads")
+        ads = c.fetchall()
+        conn.close()
+        return ads
+    except Exception as e:
+        logging.error(f"Reklama olish xatosi: {str(e)}")
+        return []
+
+def get_pending_payments():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT * FROM payments WHERE status = 'pending'")
+        payments = c.fetchall()
+        conn.close()
+        return payments
+    except Exception as e:
+        logging.error(f"To'lovlar olish xatosi: {str(e)}")
+        return []
+
+def is_admin(username):
+    return username == ADMIN_USERNAME
+
+def approve_payment(user_id, amount):
+    try:
+        add_balance(user_id, amount)
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("UPDATE payments SET status = 'approved' WHERE user_id = ? AND amount = ?", (user_id, amount))
+        conn.commit()
+        conn.close()
+        logging.info(f"To'lov tasdiqlandi: {user_id} ga {amount} birlik")
+    except Exception as e:
+        logging.error(f"To'lov tasdiqlash xatosi: {str(e)}")
+
+# -----------------------
+# FSM States
+# -----------------------
+class UserStates(StatesGroup):
+    waiting_for_phone = State()
+    waiting_for_captcha = State()
+    waiting_for_payment_amount = State()
+    waiting_for_ad_text = State()
+    waiting_for_channel_to_add = State()
+    waiting_for_channel_to_remove = State()
+    waiting_for_group_to_add = State()
+    waiting_for_group_to_remove = State()
+
+# -----------------------
+# Rate limit middleware (stub)
+# -----------------------
+class RateLimitMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        try:
+            return await handler(event, data)
+        except Exception as e:
+            logging.error(f"Middleware xatosi: {str(e)}")
+            return
+
+# -----------------------
+# Keyboards / Menus
+# -----------------------
+def main_menu(is_admin_flag=False):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📋 Vazifalar", callback_data="tasks"),
+        InlineKeyboardButton("💰 Balans", callback_data="balance"),
+    )
+    kb.add(
+        InlineKeyboardButton("👥 Referral", callback_data="referral"),
+        InlineKeyboardButton("📊 Statistika", callback_data="stats"),
+    )
+    kb.add(
+        InlineKeyboardButton("📢 Reklama joylash", callback_data="post_ad"),
+        InlineKeyboardButton("➕ Obuna topshiriq", callback_data="subscribe"),
+    )
+    kb.add(
+        InlineKeyboardButton("💳 Toʻlov qilish", callback_data="pay"),
+        InlineKeyboardButton("ℹ️ Yordam", callback_data="help")
+    )
+    if is_admin_flag:
+        kb.add(InlineKeyboardButton("⚙️ Admin panel", callback_data="admin_panel"))
+    return kb
+
+def admin_panel_menu():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("➕ Kanal qoʻshish", callback_data="admin_add_channel"),
+        InlineKeyboardButton("➖ Kanal oʻchirish", callback_data="admin_remove_channel"),
+        InlineKeyboardButton("➕ Reklama guruhi qoʻshish", callback_data="admin_add_group"),
+        InlineKeyboardButton("➖ Reklama guruhi oʻchirish", callback_data="admin_remove_group"),
+        InlineKeyboardButton("📊 Toʻliq statistika", callback_data="admin_stats"),
+        InlineKeyboardButton("💳 Kutilayotgan toʻlovlar", callback_data="admin_payments"),
+        InlineKeyboardButton("↩️ Orqaga", callback_data="back_to_main")
+    )
+    return kb
+
+def pay_method_kb():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton("Payme", callback_data="pay_method_Payme"),
+           InlineKeyboardButton("Click", callback_data="pay_method_Click"))
+    kb.add(InlineKeyboardButton("Bankomat", callback_data="pay_method_Bankomat"),
+           InlineKeyboardButton("↩️ Orqaga", callback_data="back_to_main"))
+    return kb
+
+# -----------------------
+# Bot init
+# -----------------------
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
+
+# -----------------------
+# Handlers
+# -----------------------
+async def on_startup(_):
+    logging.info("Bot ishga tushdi")
+    init_db()
+
+# Start -> show main menu or ask phone
+@dp.message.register(Command(commands=["start"]))
+async def start_command(message: Message, state: FSMContext):
+    try:
+        logging.debug(f"Start: {message.from_user.id}")
+        referrer_id = None
+        text = message.text or ""
+        parts = text.split()
+        if len(parts) > 1:
+            try:
+                referrer_id = int(parts[1])
+            except:
+                referrer_id = None
+
+        # check if phone stored
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT phone FROM users WHERE user_id = ?", (message.from_user.id,))
+        row = c.fetchone()
+        conn.close()
+
+        if row and row[0]:
+            decrypted_phone = decrypt_data(row[0]) if row[0] else None
+            add_user(message.from_user.id, message.from_user.username, decrypted_phone, referrer_id=referrer_id)
+            if referrer_id:
+                await process_referral(message.from_user.id, referrer_id)
+            await message.answer("👋 Xush kelibsiz!", reply_markup=main_menu(is_admin_flag=is_admin(message.from_user.username)))
+            await state.clear()
+        else:
+            # request phone via reply keyboard (contact)
+            kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+            kb.add(types.KeyboardButton("📲 Telefon raqamini yuborish", request_contact=True))
+            await message.answer("Iltimos, telefon raqamingiz yuboring.", reply_markup=kb)
+            await state.set_state(UserStates.waiting_for_phone)
+        log_action("User started bot", message.from_user.id)
+    except Exception as e:
+        logging.error(f"Start xatosi: {e}", exc_info=True)
+        await message.answer("Xatolik yuz berdi. Iltimos keyinroq qayta urinib ko'ring.")
+
+# Process contact (phone)
+@dp.message.register(lambda m: m.contact is not None, state=UserStates.waiting_for_phone)
+async def process_phone_contact(message: Message, state: FSMContext):
+    try:
+        phone = message.contact.phone_number
+        add_user(message.from_user.id, message.from_user.username, phone)
+        await message.answer("✅ Telefon raqamingiz saqlandi.", reply_markup=types.ReplyKeyboardRemove())
+        await message.answer("Asosiy menyu:", reply_markup=main_menu(is_admin_flag=is_admin(message.from_user.username)))
+        await state.clear()
+        log_action("Phone saved", message.from_user.id)
+    except Exception as e:
+        logging.error(f"Process phone xatosi: {e}", exc_info=True)
+        await message.answer("Telefonni saqlashda xatolik yuz berdi.")
+
+# Callback router
+@dp.callback_query.register(lambda c: True)
+async def callbacks_router(query: CallbackQuery, state: FSMContext):
+    data = query.data
+    user = query.from_user
+    await query.answer()  # clear loading indicator
+
+    # BACK TO MAIN
+    if data == "back_to_main":
+        await query.message.edit_text("Asosiy menyu:", reply_markup=main_menu(is_admin_flag=is_admin(user.username)))
+        return
+
+    # HELP
+    if data == "help":
+        help_text = ("Bu bot orqali obuna qilib ball yig'ish, reklama joylash va to'lovlar bo'yicha ishlash mumkin.\n\n"
+                     "Har qanday muammo bo'lsa adminga yozing: @"+ADMIN_USERNAME)
+        await query.message.edit_text(help_text, reply_markup=main_menu(is_admin_flag=is_admin(user.username)))
+        return
+
+    # TASKS
+    if data == "tasks":
+        tasks_text = ("📋 Vazifalar:\n\n"
+                      "1) Kanal/guruhga obuna bo'ling — ball olasiz (➕ Obuna tugmasi orqali tekshirish)\n"
+                      "2) Instagram obunasini so'rash — Instagram bo'limi (CAPTCHA orqali)\n"
+                      "3) Do'st taklif qilsangiz +5 ball (Referral bo'limda havola)")
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("➕ Obuna topshiriqni tekshirish", callback_data="subscribe"))
+        kb.add(InlineKeyboardButton("↩️ Orqaga", callback_data="back_to_main"))
+        await query.message.edit_text(tasks_text, reply_markup=kb)
+        return
+
+    # BALANCE
+    if data == "balance":
+        bal = get_balance(user.id)
+        await query.message.edit_text(f"💰 Sizning balansingiz: {bal} birlik", reply_markup=main_menu(is_admin_flag=is_admin(user.username)))
+        return
+
+    # REFERRAL
+    if data == "referral":
+        link = await generate_referral_link(user.id)
+        await query.message.edit_text(f"👥 Sizning referral havolangiz:\n{link}", reply_markup=main_menu(is_admin_flag=is_admin(user.username)))
+        return
+
+    # STATS
+    if data == "stats":
+        stats = get_stats()
+        growth_text = "\n".join([f"{date}: {'█' * count}" for date, count in stats['growth'].items()]) or "Hech qanday o'sish yo'q"
+        text = f"📊 Statistika:\nUmumiy foydalanuvchilar: {stats['total_users']}\nFaol foydalanuvchilar: {stats['active_users']}\n\nO'sish grafigi:\n{growth_text}"
+        await query.message.edit_text(text, reply_markup=main_menu(is_admin_flag=is_admin(user.username)))
+        return
+
+    # SUBSCRIBE - check mandatory channels and give reward
+    if data == "subscribe":
+        channels = get_mandatory_channels()
+        if not channels:
+            await query.message.answer("Majburiy kanal yoki guruhlar mavjud emas. Admin bilan bog'laning.")
+            return
+        bonus_per_channel = 5
+        total_bonus = 0
+        not_subscribed = []
+        for ch in channels:
+            ok = await check_subscription(user.id, ch, bot)
+            if ok:
+                total_bonus += bonus_per_channel
+            else:
+                not_subscribed.append(ch)
+        if total_bonus > 0:
+            add_balance(user.id, total_bonus)
+            text = f"🎉 Obuna tekshirildi! Sizga {total_bonus} birlik qo'shildi."
+            if not_subscribed:
+                text += "\n\nQuyidagi kanallarga hali obuna bo'lmadiz:\n" + "\n".join(not_subscribed)
+        else:
+            text = "❌ Siz hali majburiy kanallarga obuna bo'lmagansiz. Iltimos obuna bo'ling va qayta tekshiring."
+        await query.message.edit_text(text, reply_markup=main_menu(is_admin_flag=is_admin(user.username)))
+        log_action("Subscribe task attempted", user.id)
+        return
+
+    # POST AD - start ad FSM
+    if data == "post_ad":
+        await query.message.edit_text("✍️ Reklama matnini yuboring (matn yuborilgach admin tasdiqlaydi).", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="back_to_main")))
+        await state.set_state(UserStates.waiting_for_ad_text)
+        return
+
+    # PAY - choose method
+    if data == "pay":
+        await query.message.edit_text("💳 To'lov usulini tanlang:", reply_markup=pay_method_kb())
+        return
+
+    # Payment method selected -> ask amount
+    if data.startswith("pay_method_"):
+        method = data.split("_", 2)[2]
+        await query.message.edit_text(f"💳 Tanlangan usul: {method}\nIltimos to'lov miqdorini so'mda kiriting:", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="back_to_main")))
+        await state.update_data(selected_payment_method=method)
+        await state.set_state(UserStates.waiting_for_payment_amount)
+        return
+
+    # INSTAGRAM add follower -> start captcha (button not linked in menu; kept for extension)
+    if data == "add_instagram":
+        captcha = await verify_user(user.id)
+        await state.update_data(captcha_answer=captcha['answer'])
+        await state.set_state(UserStates.waiting_for_captcha)
+        await query.message.edit_text(f"🔒 CAPTCHA: {captcha['question']}\nIltimos javobni yozing.", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="back_to_main")))
+        log_action("CAPTCHA requested", user.id)
+        return
+
+    # ADMIN PANEL access
+    if data == "admin_panel":
+        if not is_admin(user.username):
+            await query.message.edit_text("❌ Siz admin emassiz.", reply_markup=main_menu(is_admin_flag=is_admin(user.username)))
+            return
+        await query.message.edit_text("⚙️ Admin panel:", reply_markup=admin_panel_menu())
+        return
+
+    # ADMIN ACTIONS
+    if data == "admin_add_channel":
+        if not is_admin(user.username):
+            await query.message.answer("Siz admin emassiz.")
+            return
+        await query.message.edit_text("Kanal username ni yuboring (masalan @kanal_nomi):", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="admin_panel")))
+        await state.set_state(UserStates.waiting_for_channel_to_add)
+        return
+
+    if data == "admin_remove_channel":
+        if not is_admin(user.username):
+            await query.message.answer("Siz admin emassiz.")
+            return
+        await query.message.edit_text("O'chiriladigan kanal username ni yuboring (masalan @kanal_nomi):", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="admin_panel")))
+        await state.set_state(UserStates.waiting_for_channel_to_remove)
+        return
+
+    if data == "admin_add_group":
+        if not is_admin(user.username):
+            await query.message.answer("Siz admin emassiz.")
+            return
+        await query.message.edit_text("Reklama guruhi ID yoki @username ni yuboring:", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="admin_panel")))
+        await state.set_state(UserStates.waiting_for_group_to_add)
+        return
+
+    if data == "admin_remove_group":
+        if not is_admin(user.username):
+            await query.message.answer("Siz admin emassiz.")
+            return
+        await query.message.edit_text("O'chiriladigan reklama guruhi ID yoki @username ni yuboring:", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="admin_panel")))
+        await state.set_state(UserStates.waiting_for_group_to_remove)
+        return
+
+    if data == "admin_stats":
+        if not is_admin(user.username):
+            await query.message.answer("Siz admin emassiz.")
+            return
+        stats = get_stats()
+        channels = get_mandatory_channels()
+        groups = get_reklama_groups()
+        ads = get_user_ads()
+        payments = get_pending_payments()
+        users = filter_users()
+        response = f"📊 To'liq Statistika:\nUmumiy foydalanuvchilar: {stats['total_users']}\nFaol: {stats['active_users']}\n"
+        response += f"Majburiy kanallar: {len(channels)}\nReklama guruhlari: {len(groups)}\nReklamalar: {len(ads)}\nKutilayotgan to'lovlar: {len(payments)}\n\n"
+        response += "Foydalanuvchilar (birinchi 30):\n"
+        for u in users[:30]:
+            response += f"ID: {u[0]}, Username: {u[1]}, Phone: {u[2]}, Balance: {u[8]}\n"
+        await query.message.edit_text(response, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="admin_panel")))
+        return
+
+    if data == "admin_payments":
+        if not is_admin(user.username):
+            await query.message.answer("Siz admin emassiz.")
+            return
+        payments = get_pending_payments()
+        if not payments:
+            await query.message.edit_text("Kutilayotgan to'lovlar yo'q.", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="admin_panel")))
+            return
+        kb = InlineKeyboardMarkup(row_width=1)
+        for p in payments:
+            pid, uid, amount, method, status, created = p
+            kb.add(InlineKeyboardButton(f"✅ Tasdiqlash: ID:{pid} User:{uid} {amount} so'm ({method})", callback_data=f"admin_approve_{pid}_{uid}_{amount}"))
+        kb.add(InlineKeyboardButton("↩️ Orqaga", callback_data="admin_panel"))
+        await query.message.edit_text("Kutilayotgan to'lovlar:", reply_markup=kb)
+        return
+
+    # Approve payment callback (admin)
+    if data.startswith("admin_approve_"):
+        if not is_admin(user.username):
+            await query.message.answer("Siz admin emassiz.")
+            return
+        parts = data.split("_")
+        try:
+            # admin_approve_<payment_id>_<user_id>_<amount>
+            pid = int(parts[2])
+            uid = int(parts[3])
+            amount = int(parts[4])
+            approve_payment(uid, amount)
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("UPDATE payments SET status = 'approved' WHERE payment_id = ?", (pid,))
+            conn.commit()
+            conn.close()
+            await query.message.edit_text(f"✅ To'lov tasdiqlandi: User {uid} ga {amount} birlik qo'shildi.", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="admin_panel")))
+            return
+        except Exception as e:
+            logging.error(f"Admin approve parse error: {e}", exc_info=True)
+            await query.message.answer("To'lovni tasdiqlashda xato.")
+            return
+
+    # Default fallback: go to main
+    await query.message.edit_text("Asosiy menyu:", reply_markup=main_menu(is_admin_flag=is_admin(user.username)))
+    return
+
+# -----------------------
+# Message handlers for FSM states (ad text, payment amount, captcha, admin inputs)
+# -----------------------
+@dp.message.register(state=UserStates.waiting_for_ad_text)
+async def receive_ad_text(message: Message, state: FSMContext):
+    try:
+        ad_text = message.text
+        groups = get_reklama_groups()
+        if not groups:
+            await message.answer("Reklama guruhlari mavjud emas. Admin bilan bog'laning.")
+            await state.clear()
+            return
+        ok = await post_ad(ad_text, groups[0], bot, message.from_user.id)
+        if ok:
+            add_balance(message.from_user.id, -50)  # charge 50 birlik
+            await message.answer("✅ Reklama joylandi va 50 birlik yechildi.", reply_markup=main_menu(is_admin_flag=is_admin(message.from_user.username)))
+        else:
+            await message.answer("❌ Reklama joylashda xatolik yuz berdi.", reply_markup=main_menu(is_admin_flag=is_admin(message.from_user.username)))
+        await state.clear()
+    except Exception as e:
+        logging.error(f"Receive ad text error: {e}", exc_info=True)
+        await message.answer("Reklama yuborishda xatolik yuz berdi.")
+        await state.clear()
+
+@dp.message.register(state=UserStates.waiting_for_payment_amount)
+async def receive_payment_amount(message: Message, state: FSMContext):
+    try:
+        text = message.text.strip()
+        if not text.isdigit():
+            await message.answer("Iltimos, faqat raqam kiriting (to'lov miqdori).")
+            return
+        amount = int(text)
+        data = await state.get_data()
+        method = data.get("selected_payment_method", "Unknown")
+        result = await process_payment(message.from_user.id, amount, method)
+        await message.answer(result['message'], reply_markup=main_menu(is_admin_flag=is_admin(message.from_user.username)))
+        await state.clear()
+        log_action("Payment requested", message.from_user.id)
+    except Exception as e:
+        logging.error(f"Payment amount error: {e}", exc_info=True)
+        await message.answer("To'lov miqdorini qabul qilishda xato yuz berdi.")
+        await state.clear()
+
+@dp.message.register(state=UserStates.waiting_for_captcha)
+async def process_captcha(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        correct = data.get("captcha_answer")
+        try:
+            user_ans = int(message.text.strip())
+        except:
+            await message.answer("Iltimos raqam kiriting.")
+            return
+        if user_ans == correct:
+            res = await add_instagram_follower(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD, "target_account")
+            if res.get("status") == "success":
+                add_balance(message.from_user.id, 10)
+                await message.answer("Instagram obunasi muvaffaqiyatli! +10 birlik", reply_markup=main_menu(is_admin_flag=is_admin(message.from_user.username)))
+            else:
+                await message.answer(f"Instagram xatosi: {res.get('message')}", reply_markup=main_menu(is_admin_flag=is_admin(message.from_user.username)))
+        else:
+            await message.answer("Noto'g'ri javob. CAPTCHA xatosi.", reply_markup=main_menu(is_admin_flag=is_admin(message.from_user.username)))
+        await state.clear()
+    except Exception as e:
+        logging.error(f"Captcha processing error: {e}", exc_info=True)
+        await message.answer("CAPTCHAni qayta ishlashda xato yuz berdi.")
+        await state.clear()
+
+# Admin channel/group add/remove states
+@dp.message.register(state=UserStates.waiting_for_channel_to_add)
+async def admin_channel_add(message: Message, state: FSMContext):
+    try:
+        if not is_admin(message.from_user.username):
+            await message.answer("Siz admin emassiz.")
+            await state.clear()
+            return
+        ch = message.text.strip()
+        add_mandatory_channel(ch)
+        await message.answer(f"✅ {ch} majburiy kanal sifatida qo'shildi.", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="admin_panel")))
+        await state.clear()
+        log_action("Admin add channel", message.from_user.id)
+    except Exception as e:
+        logging.error(f"Admin add channel error: {e}", exc_info=True)
+        await message.answer("Kanal qo'shishda xatolik yuz berdi.")
+        await state.clear()
+
+@dp.message.register(state=UserStates.waiting_for_channel_to_remove)
+async def admin_channel_remove(message: Message, state: FSMContext):
+    try:
+        if not is_admin(message.from_user.username):
+            await message.answer("Siz admin emassiz.")
+            await state.clear()
+            return
+        ch = message.text.strip()
+        remove_mandatory_channel(ch)
+        await message.answer(f"✅ {ch} majburiy kanallardan olib tashlandi.", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="admin_panel")))
+        await state.clear()
+        log_action("Admin remove channel", message.from_user.id)
+    except Exception as e:
+        logging.error(f"Admin remove channel error: {e}", exc_info=True)
+        await message.answer("Kanal o'chirishda xatolik yuz berdi.")
+        await state.clear()
+
+@dp.message.register(state=UserStates.waiting_for_group_to_add)
+async def admin_group_add(message: Message, state: FSMContext):
+    try:
+        if not is_admin(message.from_user.username):
+            await message.answer("Siz admin emassiz.")
+            await state.clear()
+            return
+        g = message.text.strip()
+        add_reklama_group(g)
+        await message.answer(f"✅ {g} reklama guruhi sifatida qo'shildi.", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="admin_panel")))
+        await state.clear()
+        log_action("Admin add group", message.from_user.id)
+    except Exception as e:
+        logging.error(f"Admin add group error: {e}", exc_info=True)
+        await message.answer("Guruh qo'shishda xatolik yuz berdi.")
+        await state.clear()
+
+@dp.message.register(state=UserStates.waiting_for_group_to_remove)
+async def admin_group_remove(message: Message, state: FSMContext):
+    try:
+        if not is_admin(message.from_user.username):
+            await message.answer("Siz admin emassiz.")
+            await state.clear()
+            return
+        g = message.text.strip()
+        remove_reklama_group(g)
+        await message.answer(f"✅ {g} reklama guruhidan olib tashlandi.", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ Orqaga", callback_data="admin_panel")))
+        await state.clear()
+        log_action("Admin remove group", message.from_user.id)
+    except Exception as e:
+        logging.error(f"Admin remove group error: {e}", exc_info=True)
+        await message.answer("Guruh o'chirishda xatolik yuz berdi.")
+        await state.clear()
+
+# -----------------------
+# Fallback: plain messages
+# -----------------------
+@dp.message.register()
+async def catch_all(message: Message, state: FSMContext):
+    text = message.text or ""
+    if text.startswith("/start"):
+        # simple start reply without reusing state
+        await message.answer("👋 Xush kelibsiz!", reply_markup=main_menu(is_admin_flag=is_admin(message.from_user.username)))
+        return
+    await message.answer("Iltimos menyudan tanlang:", reply_markup=main_menu(is_admin_flag=is_admin(message.from_user.username)))
+
+# -----------------------
+# Utility: check_subscription wrapper that uses bot.get_chat_member safely
+# -----------------------
+async def check_subscription(user_id: int, channel: str, bot_obj: Bot) -> bool:
+    try:
+        member = await bot_obj.get_chat_member(chat_id=channel, user_id=user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except Exception as e:
+        logging.debug(f"check_subscription error for {channel}: {e}")
+        return False
+
+# -----------------------
+# Run
+# -----------------------
+async def main():
+    try:
+        dp.message.middleware(RateLimitMiddleware())
+        logging.info("Bot polling boshlanmoqda...")
+        await dp.start_polling(bot, on_startup=on_startup)
+    except Exception as e:
+        logging.error(f"Bot ishga tushmadi: {str(e)}", exc_info=True)
+        print(f"Xato: Bot ishga tushmadi: {str(e)}. Iltimos, TELEGRAM_TOKEN ni tekshiring.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
